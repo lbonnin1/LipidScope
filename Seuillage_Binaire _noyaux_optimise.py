@@ -1,0 +1,212 @@
+import cv2
+import os
+import numpy as np
+import pandas as pd
+from datetime import datetime
+
+# -------------------------
+# Traitement image : seuil / binaire
+# -------------------------
+def process_image(path, threshold_value=None, use_otsu=False):
+    img_color = cv2.imread(path)
+    if img_color is None:
+        print(f"Impossible de lire l'image : {path}")
+        return None
+
+    img_gray = cv2.cvtColor(img_color, cv2.COLOR_BGR2GRAY)
+
+    if use_otsu:
+        threshold_value, binary = cv2.threshold(
+            img_gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU
+        )
+    else:
+        _, binary = cv2.threshold(
+            img_gray, threshold_value, 255, cv2.THRESH_BINARY
+        )
+
+    binary = cv2.bitwise_not(binary)
+
+    nb_white = cv2.countNonZero(binary)
+    nb_total = img_gray.size
+    nb_black = nb_total - nb_white
+
+    percent_white = (nb_white / nb_total) * 100
+    percent_black = (nb_black / nb_total) * 100
+
+    return img_color, img_gray, binary, nb_white, nb_black, nb_total, percent_white, percent_black, threshold_value
+
+# -------------------------
+# Compte les noyaux DAPI
+# -------------------------
+def count_nuclei(dapi_path):
+    img = cv2.imread(dapi_path, cv2.IMREAD_GRAYSCALE)
+    if img is None:
+        return None, None
+
+    _, binary = cv2.threshold(
+        img, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU
+    )
+
+    contours, _ = cv2.findContours(
+        binary, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE
+    )
+
+    return contours, binary
+
+# -------------------------
+# Ajoute un titre
+# -------------------------
+def add_title(img, title):
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    margin = 30
+    title_box = np.ones((margin, img.shape[1], 3), dtype=np.uint8) * 255
+    text_size = cv2.getTextSize(title, font, 0.5, 1)[0]
+    x = (img.shape[1] - text_size[0]) // 2
+    y = (margin + text_size[1]) // 2
+    cv2.putText(title_box, title, (x, y), font, 0.5, (0, 0, 0), 1, cv2.LINE_AA)
+    return np.vstack([title_box, img])
+
+# -------------------------
+# Dessine anneaux conditionnels
+# -------------------------
+def draw_nuclei_rings_conditional(binary_img, rings):
+    img_marked = cv2.cvtColor(binary_img, cv2.COLOR_GRAY2BGR)
+
+    for ring in rings:
+        if cv2.countNonZero(cv2.bitwise_and(ring, binary_img)) > 0:
+            img_marked[ring > 0] = [0, 0, 255]
+
+    return img_marked
+
+# -------------------------
+# Traite tout un dossier
+# -------------------------
+def process_folder(folder, scale=1.2, threshold_value=169, use_otsu=False, ring_width=5):
+
+    date_str = datetime.now().strftime("%Y%m%d")
+    output_dir = os.path.join(folder, f"resultats_{date_str}")
+    os.makedirs(output_dir, exist_ok=True)
+
+    results = []
+
+    # kernel
+    kernel_outer = cv2.getStructuringElement(
+        cv2.MORPH_ELLIPSE, (ring_width * 2 + 1, ring_width * 2 + 1)
+    )
+
+    for file in os.listdir(folder):
+        if not file.lower().endswith((".png", ".tif", ".jpg", ".jpeg")):
+            continue
+        if "_DAPI" in file:
+            continue
+
+        path = os.path.join(folder, file)
+        processed = process_image(path, threshold_value, use_otsu)
+        if processed is None:
+            continue
+
+        img_color, img_gray, binary, white, black, total, pw, pb, thr = processed
+
+        base, ext = file.rsplit(".", 1)
+        dapi_path = os.path.join(folder, f"{base}_DAPI.{ext}")
+
+        nuclei_contours, binary_dapi = (None, None)
+        if os.path.exists(dapi_path):
+            nuclei_contours, binary_dapi = count_nuclei(dapi_path)
+
+        nuclei_count = len(nuclei_contours) if nuclei_contours is not None else 0
+
+        # -------------------------
+        # CALCUL DES ANNEAUX
+        # -------------------------
+        rings = []
+        if nuclei_contours is not None:
+            for cnt in nuclei_contours:
+                nucleus_mask = np.zeros(binary.shape, dtype=np.uint8)
+                cv2.drawContours(nucleus_mask, [cnt], -1, 255, -1)
+                dilated = cv2.dilate(nucleus_mask, kernel_outer)
+                ring = cv2.subtract(dilated, nucleus_mask)
+                rings.append(ring)
+
+        # -------------------------
+        # PANNEAUX
+        # -------------------------
+        panels = [
+            add_title(img_color, "Originale"),
+            add_title(cv2.cvtColor(img_gray, cv2.COLOR_GRAY2BGR), "Grayscale"),
+            add_title(cv2.cvtColor(binary, cv2.COLOR_GRAY2BGR), "Binaire inverse")
+        ]
+
+        if binary_dapi is not None:
+            panels.append(
+                add_title(cv2.cvtColor(binary_dapi, cv2.COLOR_GRAY2BGR), "Noyaux DAPI")
+            )
+
+            # Anneaux rouges
+            rings_panel = cv2.cvtColor(binary, cv2.COLOR_GRAY2BGR)
+            for ring in rings:
+                rings_panel[ring > 0] = [0, 0, 255]
+            panels.append(add_title(rings_panel, "Binaire inverse + anneaux rouges"))
+
+            # Anneaux conditionnels
+            cond_panel = draw_nuclei_rings_conditional(binary, rings)
+            panels.append(add_title(cond_panel, "Anneaux rouges si touches blanc"))
+
+        combined = cv2.hconcat(panels)
+        final = cv2.resize(
+            combined,
+            (int(combined.shape[1] * scale), int(combined.shape[0] * scale))
+        )
+
+        cv2.imwrite(os.path.join(output_dir, file), final)
+
+        # -------------------------
+        # STATS EXCEL
+        # -------------------------
+        nuclei_in_white_count = 0
+        for ring in rings:
+            if cv2.countNonZero(cv2.bitwise_and(ring, binary)) > 0:
+                nuclei_in_white_count += 1
+
+        results.append((
+            file, white, black, total,
+            pw, pb, thr,
+            nuclei_count,
+            nuclei_in_white_count
+        ))
+
+    # -------------------------
+    # EXPORT CSV
+    # -------------------------
+    df = pd.DataFrame(results, columns=[
+        "Fichier",
+        "Pixels blancs", "Pixels noirs", "Total pixels",
+        "% blancs", "% noirs",
+        "Seuil utilise",
+        "Noyaux DAPI",
+        "Noyaux touchant blanc"
+    ])
+
+    csv_path = os.path.join(output_dir, f"resultats_{date_str}.csv")
+    df.to_csv(csv_path, index=False, sep=";")
+    print(f"Résultats enregistrés dans : {csv_path}")
+
+    return results
+
+# -------------------------
+# PARAMÈTRES
+# -------------------------
+
+folder = r"" # Path
+scale = 1
+use_otsu = True # Seuil automatique "True". Seuil manuel "False".
+threshold_value = 100 # Valeur du seuil manuel
+ring_width = 5
+
+results = process_folder(
+    folder,
+    scale=scale,
+    threshold_value=threshold_value,
+    use_otsu=use_otsu,
+    ring_width=ring_width
+)
